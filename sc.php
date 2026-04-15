@@ -1,185 +1,444 @@
 <?php
-############################################################################
-#    Easy AJax ShoutCast Updater with Cacheing. v1.0
-#    Copyright (C) 2011  Richard Cornwell
-#    Website: http://thegeekoftheworld.com/
-#    Email:   richard@techtoknow.net
-#
-#    This program is free software: you can redistribute it and/or
-#    modify it under the terms of the GNU General Public License as
-#    published by the Free Software Foundation, either version 3 of the
-#    License, or (at your option) any later version.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program. If not, see <http://www.gnu.org/licenses>.
-############################################################################
-#-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- Setings -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=#
-############################################################################
 
-$masterServer = "server.host.tld:port"; //e.g, "server.host.tld:port"
-$cacheOn = true; //Use status cacheing? true OR false
-$cacheTime = "20"; //Time in seconds 
-$offAirStatus = "Off air";
-$onAirStatus = "Live on Air";
-$ajaxUpdateTime = "15"; //Time in seconds
-$ajaxUpdateTimeLocked = false; //Disallow Ajax Update Timer changes via GET.
-//uncomment $slaveServers for relays
-$slaveServers = "server1.host.tld:port,server2.host.tld:port"; //e.g, $slaveServers = "server1.host.tld:port,server2.host.tld:port";
+declare(strict_types=1);
 
+/**
+ * Easy Ajax Shoutcast Updater (modernized legacy-compatible edition)
+ * Original concept and project by Richard Cornwell.
+ *
+ * This version keeps the original public behavior:
+ * - ?ajaxsync=get-shoutcast-update
+ * - ?ajaxsync=get-shoutcast-js[&updatetime=15]
+ * - Pipe-delimited response format for update requests
+ * - Same DOM IDs for drop-in frontend compatibility
+ */
 
-#=-=-=-=-=-=-=-=-=-=-=-=-=- END OF EDITING -=-=-=-=-=-=-=-=-=-=-=-=--=-=-=-#
-############################################################################
-############################################################################
-############################################################################
-function getSCData($server, $port) {
-	$open = fsockopen($server, $port);
-	if ($open) {
-		fputs($open,"GET /7.html HTTP/1.1\nUser-Agent:Mozilla\n\n");
-		$read = fread($open,1000);
-		$text = explode("content-type:text/html",$read);
-	}
-	return str_replace('<HTML><meta http-equiv="Pragma" content="no-cache"></head><body>', '', str_replace('</body></html>', '' ,$text[1]));
+/* -------------------------------------------------------------------------- */
+/* Configuration                                                               */
+/* -------------------------------------------------------------------------- */
+
+$masterServer = 'server.host.tld:port'; // e.g. server.example.com:8000
+$cacheOn = true;                        // true or false
+$cacheTime = 20;                        // seconds
+$offAirStatus = 'Off air';
+$onAirStatus = 'Live on Air';
+$ajaxUpdateTime = 15;                   // seconds
+$ajaxUpdateTimeLocked = false;          // prevent ?updatetime= override when true
+
+// Comma-separated relay list. Leave blank if unused.
+$slaveServers = 'server1.host.tld:port,server2.host.tld:port';
+
+/* -------------------------------------------------------------------------- */
+/* End of user-edit section                                                    */
+/* -------------------------------------------------------------------------- */
+
+const SC_CACHE_FILE = __DIR__ . '/sc-cache.txt';
+const SC_DEFAULT_SONG = 'N/a';
+const SC_SOCKET_TIMEOUT = 2;
+
+/**
+ * Parse "host:port" into a structured array.
+ *
+ * @return array{host:string,port:int}|null
+ */
+function parseServerAddress(string $server): ?array
+{
+    $server = trim($server);
+    if ($server === '') {
+        return null;
+    }
+
+    $parts = explode(':', $server, 2);
+    if (count($parts) !== 2) {
+        return null;
+    }
+
+    $host = trim($parts[0]);
+    $port = (int) trim($parts[1]);
+
+    if ($host === '' || $port <= 0 || $port > 65535) {
+        return null;
+    }
+
+    return [
+        'host' => $host,
+        'port' => $port,
+    ];
 }
-function makeCache($data) {
-	$fh = fopen('./sc-cache.txt', 'w') or die("Error Can't cache SC");
-	fwrite($fh, time()."||".$data);
-	fclose($fh);
+
+/**
+ * Check if the remote socket is reachable.
+ */
+function isServerOnline(string $host, int $port): bool
+{
+    $socket = @fsockopen($host, $port, $errno, $errstr, SC_SOCKET_TIMEOUT);
+    if (!is_resource($socket)) {
+        return false;
+    }
+
+    fclose($socket);
+    return true;
 }
-function readCache($cacheTimeout, $cacheOn) {
-	if($cacheOn) {
-		$fh = fopen('./sc-cache.txt', 'r') or die("Error Can't Read cache SC");
-		$cache = explode("||", fgets($fh));
-		fclose($fh);
-		$checkTime = time() - $cache[0];
-		if($checkTime > $cacheTimeout) { return true; } else { return false; }
-	} else {
-	return true;
-	}
+
+/**
+ * Fetch the Shoutcast legacy /7.html endpoint.
+ */
+function fetchShoutcastRaw(string $host, int $port): ?string
+{
+    $socket = @fsockopen($host, $port, $errno, $errstr, SC_SOCKET_TIMEOUT);
+    if (!is_resource($socket)) {
+        return null;
+    }
+
+    stream_set_timeout($socket, SC_SOCKET_TIMEOUT);
+
+    $request = sprintf(
+        "GET /7.html HTTP/1.1\r\nHost: %s\r\nUser-Agent: Easy-Ajax-Shoutcast/2.0\r\nConnection: Close\r\n\r\n",
+        $host
+    );
+
+    fwrite($socket, $request);
+
+    $response = '';
+    while (!feof($socket)) {
+        $chunk = fread($socket, 2048);
+        if ($chunk === false) {
+            break;
+        }
+        $response .= $chunk;
+    }
+
+    fclose($socket);
+
+    if ($response === '') {
+        return null;
+    }
+
+    $parts = preg_split("/\r\n\r\n|\n\n|\r\r/", $response, 2);
+    $body = $parts[1] ?? $response;
+
+    return trim(strip_tags($body));
 }
-function online($server, $port) {
-	@socket = fsockopen($server, $port, $errno, $errstr, 1);
-	if(!$socket) { return false; } else { return true; }
+
+/**
+ * Parse /7.html body into a normalized stats array.
+ *
+ * Shoutcast legacy format is typically:
+ * currentlisteners,streamstatus,peaklisteners,maxlisteners,reportedlisteners,bitrate,songtitle
+ *
+ * @return array{
+ *   listeners:int,
+ *   status:string,
+ *   peaklisteners:int,
+ *   maxlisteners:int,
+ *   uniquelisteners:int,
+ *   bitrate:int,
+ *   song:string,
+ *   rawStatus:int
+ * }|null
+ */
+function parseShoutcastStats(string $body, string $onAirStatus, string $offAirStatus): ?array
+{
+    $body = trim($body);
+    if ($body === '') {
+        return null;
+    }
+
+    $parts = array_map('trim', explode(',', $body));
+    if (count($parts) < 7) {
+        return null;
+    }
+
+    $song = implode(',', array_slice($parts, 6));
+    $rawStatus = (int) $parts[1];
+
+    return [
+        'listeners' => max(0, (int) $parts[0]),
+        'status' => $rawStatus === 1 ? $onAirStatus : $offAirStatus,
+        'peaklisteners' => max(0, (int) $parts[2]),
+        'maxlisteners' => max(0, (int) $parts[3]),
+        'uniquelisteners' => max(0, (int) $parts[4]),
+        'bitrate' => max(0, (int) $parts[5]),
+        'song' => $song !== '' ? $song : SC_DEFAULT_SONG,
+        'rawStatus' => $rawStatus,
+    ];
 }
-if($_GET['ajaxsync'] == "get-shoutcast-update" && readCache($cacheTime, $cacheOn)) {
-	$masterServerData = explode(":", $masterServer);
-	if($masterServer && online($masterServerData[0], trim($masterServerData[1]))) {
-		$masterServerData = explode(",", getSCData($masterServerData[0], trim($masterServerData[1])));
-		$shoutCast["listeners"] = $masterServerData[0];
-		if(trim($masterServerData[1]) == 1) { $shoutCast["status"] = $onAirStatus; } else { $shoutCast["status"] = $offAirStatus; }
-		$shoutCast["peaklisteners"] = (int)trim($masterServerData[2]);
-		$shoutCast["maxlisteners"] = (int)trim($masterServerData[3]);
-		$shoutCast["uniquelisteners"] = (int)trim($masterServerData[4]);
-		$shoutCast["bitrate"] = (int)trim($masterServerData[5]);
-		for ($i = 6; $i < count($masterServerData); $i++) { $shoutCast["song"] .= $masterServerData[$i] . ''; }
-		$shoutCast["serverscount"] = 1;
-		if((int)trim($masterServerData[1]) == 1) { 
-			if($slaveServers) {
-				$slaveServer = explode(",", $slaveServers);
-				for ($i = 0; $i < count($slaveServer); $i++) {
-					$slaveServerData = explode(":", $slaveServer[$i]);
-					$slaveServerData = explode(",", getSCData($slaveServerData[0], trim($slaveServerData[1])));
-					if(trim($slaveServerData[1]) == 1 && $slaveServerData[6] == $masterServerData[6]) { 
-						$shoutCast["serverscount"]++;
-						$slaveListenersCount = $slaveListenersCount + (int)trim($slaveServerData[0]);
-						$slavePeakListenersCount = $slavepPeakListenersCount + (int)trim($slaveServerData[2]);
-						$slaveMaxListenersCount = $slaveMaxListenersCount + (int)trim($slaveServerData[3]);
-						$slaveUniqueListenersCount = $slaveUniqueListenersCount + (int)trim($slaveServerData[4]);
-					}
-				}
-				if(count($slave) > 0) {
-					$shoutCast["listeners"] = $masterServerData[0] + (int)$slaveListenersCount;
-					$shoutCast["maxlisteners"] = $shoutCast["maxlisteners"] + (int)$slaveMaxListenersCount;
-					$shoutCast["peaklisteners"] = $shoutCast["peaklisteners"] + (int)$slavePeakListenersCount;
-					$shoutCast["uniquelisteners"] = $shoutCast["uniquelisteners"] + (int)$slaveUniqueListenersCount;
-				}
-			}
-		}
-	} else {
-		$shoutCast["listeners"] = 0;
-		$shoutCast["status"] = $offAirStatus;
-		$shoutCast["serverscount"] = 0;
-		$shoutCast["peaklisteners"] = 0;
-		$shoutCast["maxlisteners"] = 0;
-		$shoutCast["uniquelisteners"] = 0;
-		$shoutCast["bitrate"] = 0;
-		$shoutCast["song"] = "N/a";
-	}
-	$output = $shoutCast["listeners"]."|".$shoutCast["status"]."|".$shoutCast["serverscount"]."|".$shoutCast["peaklisteners"]."|".$shoutCast["maxlisteners"]."|".$shoutCast["uniquelisteners"]."|".$shoutCast["bitrate"]."|".$shoutCast["song"];
-	makeCache($output);
-	echo $output;
-	die();
-} else {
-	if($_GET['ajaxsync'] == "get-shoutcast-update") {
-		$fh = fopen('./sc-cache.txt', 'r') or die("Error Can't Read cache SC");
-		$cache = explode("||", fgets($fh));
-		echo $cache[1];
-		fclose($fh);
-		die();
-	}
+
+/**
+ * Read a Shoutcast server and return normalized stats.
+ */
+function getServerStats(string $server, string $onAirStatus, string $offAirStatus): ?array
+{
+    $parsed = parseServerAddress($server);
+    if ($parsed === null) {
+        return null;
+    }
+
+    if (!isServerOnline($parsed['host'], $parsed['port'])) {
+        return null;
+    }
+
+    $raw = fetchShoutcastRaw($parsed['host'], $parsed['port']);
+    if ($raw === null) {
+        return null;
+    }
+
+    return parseShoutcastStats($raw, $onAirStatus, $offAirStatus);
 }
-if($_GET['ajaxsync'] == "get-shoutcast-js") { 
-	if(!$ajaxUpdateTimeLocked && $_GET['updatetime']) { $ajaxUpdateTime = $_GET['updatetime'] * 1000; } else { $ajaxUpdateTime = $ajaxUpdateTime * 1000; }
+
+/**
+ * Return the legacy empty/offline payload structure.
+ *
+ * @return array{
+ *   listeners:int,
+ *   status:string,
+ *   serverscount:int,
+ *   peaklisteners:int,
+ *   maxlisteners:int,
+ *   uniquelisteners:int,
+ *   bitrate:int,
+ *   song:string
+ * }
+ */
+function getOfflinePayload(string $offAirStatus): array
+{
+    return [
+        'listeners' => 0,
+        'status' => $offAirStatus,
+        'serverscount' => 0,
+        'peaklisteners' => 0,
+        'maxlisteners' => 0,
+        'uniquelisteners' => 0,
+        'bitrate' => 0,
+        'song' => SC_DEFAULT_SONG,
+    ];
+}
+
+/**
+ * Build final payload, including relay aggregation when the relay appears to
+ * be carrying the same current song and is live.
+ */
+function buildPayload(
+    string $masterServer,
+    string $slaveServers,
+    string $onAirStatus,
+    string $offAirStatus
+): array {
+    $master = getServerStats($masterServer, $onAirStatus, $offAirStatus);
+    if ($master === null) {
+        return getOfflinePayload($offAirStatus);
+    }
+
+    $payload = [
+        'listeners' => $master['listeners'],
+        'status' => $master['status'],
+        'serverscount' => 1,
+        'peaklisteners' => $master['peaklisteners'],
+        'maxlisteners' => $master['maxlisteners'],
+        'uniquelisteners' => $master['uniquelisteners'],
+        'bitrate' => $master['bitrate'],
+        'song' => $master['song'],
+    ];
+
+    if ($master['rawStatus'] !== 1) {
+        return $payload;
+    }
+
+    $slaves = array_filter(array_map('trim', explode(',', $slaveServers)));
+    foreach ($slaves as $slaveServer) {
+        $slave = getServerStats($slaveServer, $onAirStatus, $offAirStatus);
+        if ($slave === null) {
+            continue;
+        }
+
+        if ($slave['rawStatus'] !== 1) {
+            continue;
+        }
+
+        if ($slave['song'] !== $master['song']) {
+            continue;
+        }
+
+        $payload['serverscount']++;
+        $payload['listeners'] += $slave['listeners'];
+        $payload['peaklisteners'] += $slave['peaklisteners'];
+        $payload['maxlisteners'] += $slave['maxlisteners'];
+        $payload['uniquelisteners'] += $slave['uniquelisteners'];
+    }
+
+    return $payload;
+}
+
+/**
+ * Convert payload to legacy pipe-delimited output.
+ */
+function payloadToLegacyString(array $payload): string
+{
+    return implode('|', [
+        $payload['listeners'],
+        $payload['status'],
+        $payload['serverscount'],
+        $payload['peaklisteners'],
+        $payload['maxlisteners'],
+        $payload['uniquelisteners'],
+        $payload['bitrate'],
+        $payload['song'],
+    ]);
+}
+
+/**
+ * Save cache contents.
+ */
+function writeCache(string $data): bool
+{
+    $contents = time() . '||' . $data;
+    return file_put_contents(SC_CACHE_FILE, $contents, LOCK_EX) !== false;
+}
+
+/**
+ * Read cache if present.
+ *
+ * @return array{timestamp:int,data:string}|null
+ */
+function readCache(): ?array
+{
+    if (!is_file(SC_CACHE_FILE) || !is_readable(SC_CACHE_FILE)) {
+        return null;
+    }
+
+    $contents = file_get_contents(SC_CACHE_FILE);
+    if ($contents === false || $contents === '') {
+        return null;
+    }
+
+    $parts = explode('||', $contents, 2);
+    if (count($parts) !== 2) {
+        return null;
+    }
+
+    return [
+        'timestamp' => (int) $parts[0],
+        'data' => $parts[1],
+    ];
+}
+
+/**
+ * Determine whether cache refresh is needed.
+ */
+function shouldRefreshCache(bool $cacheOn, int $cacheTime): bool
+{
+    if (!$cacheOn) {
+        return true;
+    }
+
+    $cache = readCache();
+    if ($cache === null) {
+        return true;
+    }
+
+    return (time() - $cache['timestamp']) > $cacheTime;
+}
+
+/**
+ * Output JavaScript used by legacy embeds.
+ */
+function outputJavascript(int $pollIntervalMs): void
+{
+    header('Content-Type: application/javascript; charset=UTF-8');
+    ?>
+(function () {
+    'use strict';
+
+    const pollInterval = <?php echo $pollIntervalMs; ?>;
+    let lastShoutcastData = null;
+
+    function updateText(id, value) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.textContent = value;
+        }
+    }
+
+    function updateShoutcastDivs(parts) {
+        updateText('sc-listenercount', parts[0] ?? '0');
+        updateText('sc-status', parts[1] ?? 'Off air');
+        updateText('sc-servercount', parts[2] ?? '0');
+        updateText('sc-peaklisteners', parts[3] ?? '0');
+        updateText('sc-maxlisteners', parts[4] ?? '0');
+        updateText('sc-uniquelisteners', parts[5] ?? '0');
+        updateText('sc-bitrate', parts[6] ?? '0');
+        updateText('sc-song', parts[7] ?? 'N/a');
+    }
+
+    function runShoutcastPull() {
+        const url = new URL(window.location.href);
+        url.searchParams.set('ajaxsync', 'get-shoutcast-update');
+        url.searchParams.set('ms', Date.now().toString());
+
+        fetch(url.toString(), {
+            cache: 'no-store',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+        })
+            .then(function (response) {
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                return response.text();
+            })
+            .then(function (text) {
+                if (text !== lastShoutcastData) {
+                    lastShoutcastData = text;
+                    updateShoutcastDivs(text.split('|'));
+                }
+            })
+            .catch(function () {
+                // Keep polling silently for legacy drop-in behavior.
+            })
+            .finally(function () {
+                window.setTimeout(runShoutcastPull, pollInterval);
+            });
+    }
+
+    runShoutcastPull();
+}());
+    <?php
+}
+
+$ajaxSync = isset($_GET['ajaxsync']) ? (string) $_GET['ajaxsync'] : '';
+
+if ($ajaxSync === 'get-shoutcast-update') {
+    header('Content-Type: text/plain; charset=UTF-8');
+
+    if (shouldRefreshCache($cacheOn, $cacheTime)) {
+        $payload = buildPayload($masterServer, $slaveServers, $onAirStatus, $offAirStatus);
+        $output = payloadToLegacyString($payload);
+        writeCache($output);
+        echo $output;
+        exit;
+    }
+
+    $cache = readCache();
+    if ($cache !== null) {
+        echo $cache['data'];
+        exit;
+    }
+
+    $payload = getOfflinePayload($offAirStatus);
+    echo payloadToLegacyString($payload);
+    exit;
+}
+
+if ($ajaxSync === 'get-shoutcast-js') {
+    $effectiveUpdateTime = $ajaxUpdateTime;
+
+    if (!$ajaxUpdateTimeLocked && isset($_GET['updatetime']) && is_numeric($_GET['updatetime'])) {
+        $effectiveUpdateTime = max(1, (int) $_GET['updatetime']);
+    }
+
+    outputJavascript($effectiveUpdateTime * 1000);
+    exit;
+}
+
 ?>
-function createRequestObject() {
-	var ro;
-	var browser = navigator.appName;
-	if (browser == "Microsoft Internet Explorer") {
-		ro = new ActiveXObject("Microsoft.XMLHTTP");
-	} else {
-	ro = new XMLHttpRequest();
-	}
-	return ro;
-}
-var ajaxsync = createRequestObject();
-var shoutcast = new Array();
-var shoutcastdata = null;
-var lastshoutcastdata = null;
-function runshoutcastpull() {
-	ajaxsync.open('get', '<?php echo $_SERVER['PHP_SELF'];?>?ajaxsync=get-shoutcast-update&ms='+ new Date().getTime());
-	ajaxsync.onreadystatechange = readshoutcaststatus;
-	ajaxsync.send(null);
-}
-function readshoutcaststatus() {
-	if (ajaxsync.readyState == 4) {
-		shoutcastdata = ajaxsync.responseText;
-		shoutcast = shoutcastdata.split('|');
-		updateShoutcastDivs();
-	}
-}
-function updateShoutcastDivs() {
-	if (ajaxsync.responseText != lastshoutcastdata) {
-		lastshoutcastdata = ajaxsync.responseText;
-		if (document.getElementById("sc-listenercount")) {
-			document.getElementById("sc-listenercount").innerHTML = shoutcast[0];
-		}
-		if (document.getElementById("sc-status")) {
-			document.getElementById("sc-status").innerHTML = shoutcast[1];
-		}
-		if (document.getElementById("sc-servercount")) {
-			document.getElementById("sc-servercount").innerHTML = shoutcast[2];
-		}
-		if (document.getElementById("sc-peaklisteners")) {
-			document.getElementById("sc-peaklisteners").innerHTML = shoutcast[3];
-		}
-		if (document.getElementById("sc-maxlisteners")) {
-			document.getElementById("sc-maxlisteners").innerHTML = shoutcast[4];
-		}
-		if (document.getElementById("sc-uniquelisteners")) {
-			document.getElementById("sc-uniquelisteners").innerHTML = shoutcast[5];
-		}
-		if (document.getElementById("sc-bitrate")) {
-			document.getElementById("sc-bitrate").innerHTML = shoutcast[6];
-		}
-		if (document.getElementById("sc-song")) {
-			document.getElementById("sc-song").innerHTML = shoutcast[7];
-		}
-	}
-	setTimeout("runshoutcastpull()", <?php echo $ajaxUpdateTime; ?>);
-}
-runshoutcastpull();
-<?php die(); } ?>
