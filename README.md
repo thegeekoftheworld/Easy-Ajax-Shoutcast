@@ -143,4 +143,4 @@ The refreshed `sc.php` keeps the same outward functionality while improving inte
 
 ## License
 
-Originally released by Richard Cornwell. Keep your preferred project license here if you want to add one explicitly to the repository.
+See LICENSE file.
